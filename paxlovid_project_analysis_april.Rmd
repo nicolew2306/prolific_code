@@ -1,0 +1,974 @@
+---
+title: "Prolific"
+author: "Nicole Wagner"
+output: html_document
+date: "2026-02-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r}
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+library(readxl)
+library(broom.mixed)
+library(emmeans)
+library(broom)
+library(broom.mixed)
+library(purrr)
+library(stringr)
+```
+
+---
+
+# reading in files
+```{r}
+# masterfile previously calculated with all viral marker, immune markers, raw values, normalized values and delta and log fold change values
+master_file <- read.csv("/Users/nicole.wagner/Library/CloudStorage/OneDrive-KarolinskaInstitutet/Documents/Folders_to_transfer_to_KI_laptop/paxlovid_2026/My_stuff/March_2026_files/master_file_outcome_nano_olink.csv")
+
+
+```
+
+# First: Viral biology
+
+	
+## definig the log transformed viral markers
+```{r}
+viral_markers <- c(
+  "nano_Envelope_nano_log2",
+  "nano_ORF3a_nano_log2",
+  "nano_Nucleocapsid_nano_log2",
+  "nano_ORF7a_nano_log2",
+  "nano_ORF1ab_nano_log2",
+  "nano_SARS_CoV_2_orf1ab_REV_nano_log2",
+  "nano_Spike_nano_log2"
+ # "nano_FYN_nano_log2"
+)
+```
+
+## pivoting to the current format 
+```{r}
+
+viral_long <- master_file %>%
+  mutate(treatment_group = trtgrp,
+          time_num = as.numeric(visit),
+          time_factor = factor(visit,
+                         levels = c(1,16,45,90),
+                         labels = c("d1","d16","d45","d90"))) %>%
+  filter(visit %in% c(1,16,45)) %>%
+  dplyr::select(subject_id, treatment_group, time_num, time_factor,
+         all_of(viral_markers)) %>%
+  pivot_longer(
+    cols = all_of(viral_markers),
+    names_to = "gene",
+    values_to = "viral_value"
+  ) %>%
+  filter(!is.na(viral_value))
+  
+  
+ 
+```
+
+
+
+## baseline balance /// at baseline we note no significant difference between the two groups (old run)
+```{r}
+baseline_df <- viral_long %>%
+  filter(time_factor == "d1")
+
+baseline_tests <- baseline_df %>%
+  group_by(gene) %>%
+  do(tidy(t.test(viral_value ~ treatment_group, data = .)))
+```
+
+
+
+## looking at the interaction terms
+ pvalues and estimates
+
+interaction interpretation:
+For each gene:
+	•	interaction p < 0.05 → treatment changes viral trajectory over time
+	•	estimate < 0 → faster decline under treatment
+	•	estimate > 0 → slower decline under treatment
+
+
+
+## baseline adjusted sensitivity model
+ The interaction terms indicate an additional decrease in viral load at both day 16 and day 45 in the Paxlovid group relative to placebo.
+
+```{r}
+baseline_vals <- viral_long %>%
+  filter(time_factor == "d1") %>%
+  select(subject_id, gene, baseline_val = viral_value)
+
+viral_adj <- viral_long %>%
+  left_join(baseline_vals, by = c("subject_id","gene"))
+
+baseline_adjusted_viral_model <- lmer(
+  viral_value ~ baseline_val + time_factor * treatment_group + (1 | subject_id),
+  data = viral_adj
+)
+```
+## A forest plot for the interaction term
+
+```{r}
+
+
+
+# Placebo as reference; baseline/screening timepoint as reference
+viral_adj_2 <- viral_adj %>%
+  mutate(
+    treatment_group = factor(treatment_group, levels = c("Placebo", "Paxlovid")),
+    time_factor = factor(time_factor, levels = c("d1", "d16", "d45"))  
+  )
+
+
+# FIT MODELS PER MARKER/Gene
+
+models <- viral_adj_2 %>%
+  group_by(gene) %>%  
+  group_map(.keep = TRUE, ~ {
+    dat <- .x
+    # lmer will drop rows with NAs in any used variable automatically, but being explicit:
+    dat <- dat %>% filter(!is.na(viral_value), !is.na(time_factor), !is.na(treatment_group))
+
+    m <- lmer(viral_value ~ baseline_val + time_factor * treatment_group + (1 | subject_id),
+              data = dat, REML = TRUE)
+    list(gene = unique(dat$gene), model = m)
+  })
+
+# element name list
+models_named <- setNames(lapply(models, `[[`, "model"),
+                         vapply(models, function(x) as.character(x$gene), character(1)))
+
+# interaction terms
+res <- imap_dfr(models_named, ~{
+  broom.mixed::tidy(.x, effects = "fixed", conf.int = TRUE) %>%
+    mutate(gene = .y)
+}) %>%
+  filter(str_detect(term, "^time_factor.*:treatment_groupPaxlovid$")) %>%
+  mutate(
+    timepoint = str_match(term, "^time_factor(.*):treatment_groupPaxlovid$")[,2],
+    # nice labels
+    timepoint = recode(timepoint, "d16" = "Day 16", "d45" = "Day 45",
+                       .default = timepoint),
+    effect_label = paste0(gene, " — ", timepoint)
+  )
+
+#  multiple-testing correction across all extracted tests
+res <- res %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+
+
+
+res <- res %>%
+  arrange(p_adj, estimate) %>%
+  mutate(effect_label = factor(effect_label, levels = rev(unique(effect_label))))
+
+
+```
+
+
+## facet by timepoint
+```{r}
+res2 <- res %>%
+  mutate(gene = factor(gene, levels = rev(unique(gene)))) %>%
+  mutate(gene_clean = stringr::str_extract(gene, "(?<=nano_).*?(?=_nano)"))
+
+res2 <- res2 %>%
+  mutate(sig = p.value < 0.05)   # or p_adj < 0.05
+
+p <- ggplot(res2, aes(x = estimate, y = gene_clean)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(aes(color = sig), size = 2) +
+  geom_text(
+    aes(
+      label = sprintf("p=%.3f", p.value),
+      x = conf.high + 0.02
+    ),
+    size = 3,
+    hjust = 0
+  ) +
+  facet_wrap(~timepoint, scales = "free_y") +
+  theme_bw() +
+  labs(
+    x = "Interaction effect (Paxlovid vs Placebo at timepoint)",
+    y = NULL
+  ) +
+  scale_color_manual(
+    values = c("FALSE" = "black", "TRUE" = "red"),
+    guide = "none"
+  )
+
+p
+```
+
+
+# second: Clinical Outcomes
+
+
+## first set up and define the outcomes
+
+```{r}
+
+
+lower_better <- c("fss_score","mfs_score","cat","mmrc",
+                  "nijmegen_score","compass_31_total","maps")
+
+higher_better <- c("x6mwt_of_predicted","grip_str_of_predicted",
+                   "steps_per_day_scaled","n_sit_to_stand","stepping_time",
+                   "moca")
+
+all_outcomes <- c(lower_better, higher_better)
+delta_cols <- paste0("delta_", all_outcomes)
+```
+
+```{r}
+master_file <- master_file %>%
+  mutate(
+    steps_per_day_scaled = as.numeric(scale(steps_per_day))
+  )
+
+
+steps_delta <- master_file %>%
+  select(subject_id, visit, steps_per_day_scaled) %>%
+  group_by(subject_id) %>%
+  arrange(visit, .by_group=TRUE) %>%
+  mutate(
+    baseline_steps_scaled = steps_per_day_scaled[visit == 1][1],
+    delta_steps_per_day_scaled =
+      steps_per_day_scaled - baseline_steps_scaled
+  ) %>%
+  ungroup() %>%
+  select(subject_id, visit, delta_steps_per_day_scaled)
+
+master_file <- master_file %>%
+  left_join(
+    steps_delta,
+    by = c("subject_id","visit")
+  ) 
+```
+
+
+## prepping the clinicial data
+
+```{r}
+df_clin2 <- master_file %>%
+  rename(treatment_group = trtgrp) %>%
+  mutate(
+    treatment_group = factor(treatment_group,
+                             levels = c("Placebo","Paxlovid")),
+    visit = as.integer(visit),
+    time_factor = factor(
+      visit,
+      levels = c(1,16,45,90),
+      labels = c("d1","d16","d45","d90")
+    )
+  )
+```
+
+## long table and direction alignment
+```{r}
+long_delta <- df_clin2 %>%
+  select(subject_id, treatment_group, visit, time_factor,
+         all_of(all_outcomes), all_of(delta_cols)) %>%
+  pivot_longer(
+    cols = all_of(c(all_outcomes, delta_cols)),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+long_delta <- long_delta %>%
+  mutate(
+    is_delta = str_starts(variable, "delta_"),
+    outcome = str_remove(variable, "^delta_")
+  )
+
+long_delta <- long_delta %>%
+  mutate(
+    value_type = if_else(is_delta, "delta", "value")
+  ) %>%
+  select(-variable) %>%
+  pivot_wider(
+    names_from = value_type,
+    values_from = value
+  )
+
+long_delta <- long_delta %>%
+  mutate(
+    delta_improve = case_when(
+      outcome %in% lower_better ~ -delta,
+      outcome %in% higher_better ~ delta,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+## checking timepoints that have an outcomes (if outcome was measured at that time)
+```{r}
+timepoint_map <- long_delta %>%
+  filter(!is.na(delta_improve)) %>%
+  group_by(outcome) %>%
+  summarise(
+    timepoints = paste(sort(unique(time_factor)), collapse = ", "),
+    n_timepoints = n_distinct(time_factor),
+    .groups="drop"
+  )
+
+#write.csv(timepoint_map,"outcome_measurement_timepoint_map.csv")
+timepoint_map
+```
+
+## missingness filter (keeping outcomes that have enough subject per arm for at least one timepoint followup)
+
+```{r}
+min_n_per_arm_time <- 10
+
+keep_outcomes <- long_delta %>%
+  filter(!is.na(delta_improve), time_factor != "d1") %>%
+  
+  # count per arm
+  group_by(outcome, time_factor, treatment_group) %>%
+  summarise(n = n_distinct(subject_id), .groups = "drop") %>%
+  
+  # get min per arm
+  group_by(outcome, time_factor) %>%
+  summarise(min_arm_n = min(n), .groups = "drop") %>%
+  
+  #  now operate ONLY on observed timepoints
+  group_by(outcome) %>%
+  summarise(
+    n_timepoints = n(),  # how many timepoints exist for this outcome
+    all_ok = all(min_arm_n >= min_n_per_arm_time),
+    .groups = "drop"
+  ) %>%
+  
+  filter(all_ok) %>%
+  pull(outcome)
+
+long_delta_filt <- long_delta %>%
+  filter(outcome %in% keep_outcomes,
+         !is.na(delta_improve),
+         time_factor != "d1")
+```
+
+## model per outcome (to handle all oucomes including ones with missing timepoint such as moca which has only two timepoints)
+
+
+```{r}
+baseline_df <- long_delta %>%
+  filter(time_factor == "d1") %>%
+  select(subject_id, outcome, baseline_value = value)
+
+long_value <- long_delta %>%
+  left_join(baseline_df, by = c("subject_id", "outcome"))
+
+long_value_filt <- long_value %>%
+  filter(outcome %in% keep_outcomes,
+         time_factor != "d1",
+         !is.na(value),
+         !is.na(baseline_value))
+```
+```{r}
+timepoint_counts <- long_value_filt %>%
+  distinct(outcome, time_factor) %>%
+  count(outcome, name = "n_timepoints")
+
+long_value_filt2 <- long_value_filt %>%
+  left_join(timepoint_counts, by = "outcome")
+```
+
+
+```{r}
+fit_one <- function(df_one) {
+  n_tp <- dplyr::n_distinct(df_one$time_factor)
+
+  if (n_tp == 1) {
+    lm(
+      value ~ treatment_group + baseline_value,
+      data = df_one
+    )
+  } else {
+    lmer(
+      value ~ time_factor * treatment_group +
+        baseline_value +
+        (1 | subject_id),
+      data = df_one,
+      REML = TRUE
+    )
+  }
+}
+
+models <- long_value_filt2 %>%
+  group_by(outcome) %>%
+  group_split() %>%
+  set_names(map_chr(., ~ unique(.x$outcome))) %>%
+  map(fit_one)
+```
+
+## extract treatment effects at each timepoint
+```{r}
+
+
+extract_one <- function(model, outcome_name, df_one) {
+  n_tp <- dplyr::n_distinct(df_one$time_factor)
+
+  if (n_tp == 1) {
+    broom::tidy(model, conf.int = TRUE) %>%
+      filter(term == "treatment_groupPaxlovid") %>%
+      transmute(
+        outcome = outcome_name,
+        timepoint = as.character(unique(df_one$time_factor)),
+        contrast = "Paxlovid - Placebo",
+        estimate = estimate,
+        std.error = std.error,
+        statistic = statistic,
+        p.value = p.value,
+        conf.low = conf.low,
+        conf.high = conf.high
+      )
+  } else {
+    emmeans(model, ~ treatment_group | time_factor) %>%
+      contrast(method = "revpairwise") %>%   # gives Paxlovid - Placebo
+      summary(infer = TRUE) %>%
+      as.data.frame() %>%
+      transmute(
+        outcome = outcome_name,
+        timepoint = as.character(time_factor),
+        contrast = contrast,
+        estimate = estimate,
+        std.error = SE,
+        statistic = t.ratio,
+        p.value = p.value,
+        conf.low = lower.CL,
+        conf.high = upper.CL
+      )
+  }
+}
+```
+
+
+```{r}
+models_input <- long_value_filt %>%
+  group_by(outcome) %>%
+  group_split() %>%
+  set_names(map_chr(., ~ unique(.x$outcome)))
+
+results <- map_df(models_input, function(df_one) {
+  outcome_name <- unique(df_one$outcome)
+  model <- fit_one(df_one)
+  extract_one(model, outcome_name, df_one)
+})
+results <- results %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH"))
+```
+
+## forest plot
+
+	
+	•	CI crossing 0 → not statistically supported
+	•	BH-adjusted p < 0.05 → multiple-testing robust
+	•	estimate > 0 → Paxlovid showed more improvement than placebo
+	•	estimate < 0 → Paxlovid showed less improvement / worse change than placebo
+
+
+```{r}
+
+forest_df <- results %>%
+  mutate(
+    timepoint = factor(timepoint, levels = c("d16", "d45", "d90")),
+
+    estimate_harmonized = case_when(
+      outcome %in% lower_better ~ -estimate,
+      outcome %in% higher_better ~ estimate,
+      TRUE ~ estimate
+    ),
+    conf.low.harmonized = case_when(
+      outcome %in% lower_better ~ -conf.high,
+      outcome %in% higher_better ~ conf.low,
+      TRUE ~ conf.low
+    ),
+    conf.high.harmonized = case_when(
+      outcome %in% lower_better ~ -conf.low,
+      outcome %in% higher_better ~ conf.high,
+      TRUE ~ conf.high
+    ),
+
+    effect_dir = if_else(
+      estimate_harmonized > 0,
+      "Paxlovid more improvement",
+      "Paxlovid less improvement"
+    ),
+
+    label = paste(outcome, timepoint, sep = " — ")
+  ) %>%
+  arrange(outcome, timepoint) %>%
+  mutate(label = factor(label, levels = label))
+
+
+p <- ggplot(forest_df,
+       aes(x = estimate_harmonized, y = label, color = effect_dir)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = conf.low.harmonized, xmax = conf.high.harmonized),
+                 height = 0.2,
+                 color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c(
+    "Paxlovid more improvement" = "blue",
+    "Paxlovid less improvement" = "orange"
+  )) +
+  labs(
+    x = "Treatment effect on improvement from baseline",
+    y = "",
+    color = "",
+    title = "Treatment Effects on Continuous Secondary Outcomes by Timepoint"
+  ) +
+  theme_bw()
+p
+```
+
+### eqvas table details
+
+```{r}
+eqvas_table <- df_clin2 %>%
+  filter(!is.na(eqvas)) %>%
+  group_by(treatment_group, visit) %>%
+  summarise(
+    n = n(),
+    mean = mean(eqvas, na.rm = TRUE),
+    sd = sd(eqvas, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+eqvas_table_wide <- eqvas_table %>%
+  mutate(mean_sd = sprintf("%d, %.1f ± %.1f", n, mean, sd)) %>%
+  select(visit, treatment_group, mean_sd) %>%
+  pivot_wider(
+    names_from = treatment_group,
+    values_from = mean_sd
+  )
+
+#write.csv(eqvas_table_wide,"eqvas_table_wide.csv")
+
+```
+
+### eqvas analysis alone 16
+```{r}
+eqvas_df <- df_clin2 %>%
+  select(subject_id, treatment_group, visit, eqvas) %>%
+  filter(visit %in% c(1, 16)) %>%
+  pivot_wider(
+    names_from = visit,
+    values_from = eqvas,
+    names_prefix = "d"
+  ) %>%
+  rename(
+    eqvas_d1 = d1,
+    eqvas_d16 = d16
+  ) %>%
+  filter(!is.na(eqvas_d1), !is.na(eqvas_d16))
+
+model_eqvas <- lm(
+  eqvas_d16 ~ treatment_group + eqvas_d1,
+  data = eqvas_df
+)
+
+library(broom)
+
+res_eqvas_16 <- tidy(model_eqvas, conf.int = TRUE) %>%
+  filter(term == "treatment_groupPaxlovid")
+```
+
+
+# now defining a responder threshold for the outcomes
+
+## definining threshold and groups
+
+```{r}
+
+lower_better <- c("fss_score","mfs_score","cat","mmrc",
+                  "nijmegen_score","compass_31_total","maps")
+
+higher_better <- c("steps_per_day_scaled","stepping_time","n_sit_to_stand",
+                   "x6mwt_of_predicted","eqvas","moca")
+
+all_outcomes <- c(lower_better, higher_better)
+```
+
+
+## extracting baseline values
+```{r}
+baseline_df <- master_file %>%
+  filter(visit == 1) %>%
+  select(subject_id, all_of(all_outcomes)) %>%
+  pivot_longer(
+    cols = all_of(all_outcomes),
+    names_to = "outcome",
+    values_to = "baseline_val"
+  )
+```
+
+## build delta table and baseline joined
+```{r}
+delta_cols <- paste0("delta_", all_outcomes)
+
+delta_long <- master_file %>%
+  rename(treatment_group = trtgrp) %>%
+  mutate(
+    treatment_group = factor(treatment_group,
+                             levels = c("Placebo","Paxlovid")),
+    visit = as.integer(visit)) %>%
+  select(subject_id, visit, treatment_group, all_of(delta_cols)) %>%
+  pivot_longer(
+    cols = all_of(delta_cols),
+    names_to = "outcome",
+    values_to = "delta",
+    names_prefix = "delta_"
+  )
+
+resp_long <- delta_long %>%
+  left_join(baseline_df, by = c("subject_id","outcome"))
+```
+
+## direction corrected improvement score
+
+```{r}
+resp_long <- resp_long %>%
+  mutate(
+    direction = case_when(
+      outcome %in% higher_better ~  1,
+      outcome %in% lower_better  ~ -1,
+      TRUE ~ NA_real_
+    ),
+    improv = direction * delta
+  )
+```
+
+## responder flag (75% + sensitivity)
+```{r}
+eps <- 1e-6
+
+resp_long <- resp_long %>%
+  mutate(
+    base_abs = pmax(abs(baseline_val), eps),
+
+    resp_75 = improv >= 0.75 * base_abs,
+    resp_50 = improv >= 0.50 * base_abs,
+    resp_90 = improv >= 0.90 * base_abs
+  )
+```
+
+## sensitivity table
+```{r}
+resp_long %>%
+  group_by(outcome, visit, treatment_group) %>%
+  summarise(
+    n = n(),
+    resp_rate_75 = mean(resp_75, na.rm=TRUE),
+    resp_rate_50 = mean(resp_50, na.rm=TRUE),
+    resp_rate_90 = mean(resp_90, na.rm=TRUE)
+  )
+
+#write.csv(resp_long,"responder_table_sensitivity.csv")
+```
+
+## Responder analysis
+
+```{r}
+
+df0 <- master_file %>%
+  rename(treatment_group = trtgrp)
+```
+
+```{r}
+# 1) compute baseline mean/sd for steps
+steps_ref <- df0 %>% filter(visit == 1) %>% summarise(mu = mean(steps_per_day, na.rm=TRUE),
+                                                     sd = sd(steps_per_day, na.rm=TRUE))
+
+mu_steps <- steps_ref$mu
+sd_steps <- steps_ref$sd
+
+# 2) scaled steps
+df0 <- df0 %>%
+  mutate(steps_per_day_scaled = (steps_per_day - mu_steps) / sd_steps)
+
+# 3) baseline scaled steps per subject
+steps_bl <- df0 %>%
+  filter(visit == 1) %>%
+  select(subject_id, steps_per_day_scaled_bl = steps_per_day_scaled)
+
+# 4) delta scaled steps (current - baseline)
+df0 <- df0 %>%
+  left_join(steps_bl, by = "subject_id") %>%
+  mutate(delta_steps_per_day_scaled = steps_per_day_scaled - steps_per_day_scaled_bl)
+```
+
+```{r}
+lower_better <- c("fss_score","mfs_score","cat","mmrc",
+                  "nijmegen_score","compass_31_total","maps")
+higher_better <- c("x6mwt_of_predicted","grip_str_of_predicted",
+                   "steps_per_day_scaled","n_sit_to_stand","stepping_time",
+                   "eqvas","moca")
+
+all_outcomes <- c(lower_better, higher_better)
+
+delta_cols <- paste0("delta_", all_outcomes)
+
+df_delta_long <- df0 %>%
+  select(subject_id, visit, treatment_group, all_of(delta_cols)) %>%
+  pivot_longer(
+    cols = all_of(delta_cols),
+    names_to = "outcome",
+    values_to = "delta"
+  ) %>%
+  mutate(outcome = str_remove(outcome, "^delta_"))
+```
+
+```{r}
+# baseline values in long form
+df_baseline_long <- df0 %>%
+  filter(visit == 1) %>%
+  select(subject_id, all_of(all_outcomes)) %>%
+  pivot_longer(cols = all_of(all_outcomes),
+               names_to = "outcome",
+               values_to = "baseline_val")
+
+# join baseline onto deltas
+df_resp_base <- df_delta_long %>%
+  left_join(df_baseline_long, by = c("subject_id","outcome"))
+```
+
+```{r}
+df_resp <- df_resp_base %>%
+  mutate(
+    direction = case_when(
+      outcome %in% lower_better ~ "lower_better",
+      outcome %in% higher_better ~ "higher_better",
+      TRUE ~ NA_character_
+    ),
+    pct_change = ifelse(is.na(baseline_val) | baseline_val == 0, NA_real_,
+                        delta / abs(baseline_val)),
+
+    resp_50 = case_when(
+      direction == "lower_better"  ~ as.integer(pct_change <= -0.50),
+      direction == "higher_better" ~ as.integer(pct_change >=  0.50),
+      TRUE ~ NA_integer_
+    ),
+    resp_75 = case_when(
+      direction == "lower_better"  ~ as.integer(pct_change <= -0.75),
+      direction == "higher_better" ~ as.integer(pct_change >=  0.75),
+      TRUE ~ NA_integer_
+    ),
+    resp_90 = case_when(
+      direction == "lower_better"  ~ as.integer(pct_change <= -0.90),
+      direction == "higher_better" ~ as.integer(pct_change >=  0.90),
+      TRUE ~ NA_integer_
+    )
+  )
+```
+
+## Fisher and Responder NNT
+###removing baseline and NA
+```{r}
+resp_df <- df_resp %>%
+  filter(visit != 1) %>%      # remove baseline
+  filter(!is.na(resp_50))     # remove outcomes not measured at that visit
+```
+
+### reshaping for correct threshold
+```{r}
+resp_long <- resp_df %>%
+  pivot_longer(
+    cols = c(resp_50, resp_75, resp_90),
+    names_to = "threshold",
+    values_to = "responder"
+  )
+```
+
+### responder rates
+```{r}
+resp_summary <- resp_long %>%
+  group_by(outcome, visit, threshold, treatment_group) %>%
+  summarise(
+    responders = sum(responder == 1, na.rm = TRUE),
+    n = n(),
+    rate = responders / n,
+    .groups = "drop"
+  )
+
+#write.csv(resp_summary,"responder_summary_rates.csv")
+
+```
+
+
+
+# risk difference
+
+```{r}
+calc_rd <- function(data, resp_col) {
+
+  tab <- data %>%
+    group_by(treatment_group) %>%
+    summarise(
+      n = n_distinct(subject_id),
+      responders = sum(.data[[resp_col]] == 1, na.rm = TRUE),
+      rate = responders / n,
+      .groups = "drop"
+    )
+
+  if(nrow(tab) < 2) {
+    return(tibble(
+      pax_rate = NA,
+      pbo_rate = NA,
+      risk_diff = NA,
+      p_value = NA
+    ))
+  }
+
+  pax_rate <- tab$rate[tab$treatment_group == "Paxlovid"]
+  pbo_rate <- tab$rate[tab$treatment_group == "Placebo"]
+
+  rd <- pax_rate - pbo_rate
+
+  mat <- table(data$treatment_group, data[[resp_col]])
+
+  test <- tryCatch(
+    fisher.test(mat),
+    error = function(e) NULL
+  )
+
+  tibble(
+    pax_rate = pax_rate,
+    pbo_rate = pbo_rate,
+    risk_diff = rd,
+    p_value = ifelse(is.null(test), NA, test$p.value)
+  )
+}
+```
+
+
+
+```{r}
+rd_75 <- df_resp %>%
+  filter(!is.na(resp_75)) %>%
+  group_by(outcome, visit) %>%
+  group_modify(~ calc_rd(.x, "resp_75")) %>%
+  ungroup()
+
+rd_75 <- rd_75 %>%
+  mutate(p_adj = p.adjust(p_value, method="BH"))
+
+rd_75 <- rd_75 %>%
+  mutate(nnt = ifelse(risk_diff > 0, 1/risk_diff, NA))
+
+#write.csv(rd_75,"risk_difference_75percent.csv")
+
+```
+
+```{r}
+rd_50 <- df_resp %>%
+  filter(!is.na(resp_50)) %>%
+  group_by(outcome, visit) %>%
+  group_modify(~ calc_rd(.x, "resp_50")) %>%
+  ungroup()
+
+rd_50 <- rd_50 %>%
+  mutate(p_adj = p.adjust(p_value, method="BH"))
+
+rd_50 <- rd_50 %>%
+  mutate(nnt = ifelse(risk_diff > 0, 1/risk_diff, NA))
+
+rd_90 <- df_resp %>%
+  filter(!is.na(resp_90)) %>%
+  group_by(outcome, visit) %>%
+  group_modify(~ calc_rd(.x, "resp_90")) %>%
+  ungroup()
+
+rd_90 <- rd_90 %>%
+  mutate(p_adj = p.adjust(p_value, method="BH"))
+
+rd_90 <- rd_90 %>%
+  mutate(nnt = ifelse(risk_diff > 0, 1/risk_diff, NA))
+
+#write.csv(rd_50,"risk_difference_50percent.csv")
+
+#write.csv(rd_90,"risk_difference_90percent.csv")
+
+
+```
+
+```{r}
+
+rd_75 <- rd_75 %>%
+  filter(visit != 1)
+
+p_75 <- ggplot(rd_75,
+       aes(x = risk_diff,
+           y = reorder(outcome, risk_diff),
+           color = risk_diff > 0)) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~visit) +
+  scale_color_manual(values = c("firebrick","steelblue"),
+                     labels = c("Placebo favored","Paxlovid favored"),
+                     name = "Direction") +
+  labs(
+    title = "Risk Difference in ≥75% Responders",
+    x = "Risk difference (Paxlovid − Placebo)",
+    y = "Outcome"
+  ) +
+  theme_bw()
+
+rd_90 <- rd_90 %>%
+  filter(visit != 1)
+
+p_90 <- ggplot(rd_90,
+       aes(x = risk_diff,
+           y = reorder(outcome, risk_diff),
+           color = risk_diff > 0)) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~visit) +
+  scale_color_manual(values = c("firebrick","steelblue"),
+                     labels = c("Placebo favored","Paxlovid favored"),
+                     name = "Direction") +
+  labs(
+    title = "Risk Difference in ≥90% Responders",
+    x = "Risk difference (Paxlovid − Placebo)",
+    y = "Outcome"
+  ) +
+  theme_bw()
+
+
+rd_50 <- rd_50 %>%
+  filter(visit != 1)
+
+p_50 <- ggplot(rd_50,
+       aes(x = risk_diff,
+           y = reorder(outcome, risk_diff),
+           color = risk_diff > 0)) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~visit) +
+  scale_color_manual(values = c("firebrick","steelblue"),
+                     labels = c("Placebo favored","Paxlovid favored"),
+                     name = "Direction") +
+  labs(
+    title = "Risk Difference in ≥50% Responders",
+    x = "Risk difference (Paxlovid − Placebo)",
+    y = "Outcome"
+  ) +
+  theme_bw()
+```
+
